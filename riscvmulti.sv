@@ -1,21 +1,21 @@
 module riscvmulti (
-    input 	      clk,
-    input 	      reset,
+    input         clk,
+    input         reset,
     output [31:0] Address, 
     output [31:0] WriteData,
-    output 	      MemWrite,
+    output        MemWrite,
     input  [31:0] ReadData,
     output  [3:0] WriteMask, 
     output logic  halt = 0); 
 
     logic [31:0] instr, PC = 0;
 
-    wire writeBackEn = // Quando se escreve no banco de registradores?
-    wire [31:0] writeBackData = // O que se escreve no banco de registradores?
-    wire [31:0] LoadStoreAddress = // Como se calcula o endereço de memória para loads e stores?
-    assign Address = // Qual o endereço de memória a ser acessado? Alternar entre .text e .data dependendo do estado
-    assign MemWrite = // Em que estado se escreve na memória?
-    assign WriteData = // O que se escreve na memória?
+    // Sinais de writeback e acesso à memória
+    wire         writeBackEn;
+    wire [31:0]  writeBackData;
+    wire [31:0]  LoadStoreAddress;
+    wire [31:0]  LoadData;
+    wire [1:0]   byteOffset;
 
     // The 10 RISC-V instructions
     wire isALUreg  =  (instr[6:0] == 7'b0110011); // rd <- rs1 OP rs2   
@@ -97,7 +97,7 @@ module riscvmulti (
             3'b100: ALUResult = (SrcA ^ SrcB);
             3'b101: ALUResult = shifter;
             3'b110: ALUResult = (SrcA | SrcB);
-            3'b111: ALUResult = (SrcA & SrcB);	
+            3'b111: ALUResult = (SrcA & SrcB);  
         endcase
     end
 
@@ -135,6 +135,79 @@ module riscvmulti (
     localparam STORE       = 6;
     reg [2:0] state = FETCH_INSTR;
 
+    // ---------------------------------------------------------
+    // Caminho de dados de memória (load/store) + writeback
+    // ---------------------------------------------------------
+
+    // Endereço efetivo de load/store
+    assign LoadStoreAddress = rs1 + (isLoad ? Iimm : Simm);
+
+    // Offset dentro da word
+    assign byteOffset = LoadStoreAddress[1:0];
+
+    // Seleção de endereço da memória:
+    //  - PC para busca de instrução
+    //  - LoadStoreAddress para dados (.data)
+    assign Address =
+        (state == FETCH_INSTR || state == WAIT_INSTR) ?
+            PC :
+            LoadStoreAddress;
+
+    // Escreve na memória apenas no estado STORE
+    assign MemWrite = (state == STORE) && isStore;
+
+    // Dado a ser escrito: rs2 alinhado no byte/half correspondente
+    assign WriteData = rs2 << (8 * byteOffset);
+
+    // Máscara de escrita por byte (SB/SH/SW)
+    assign WriteMask =
+        (state == STORE && isStore) ? (
+            (funct3 == 3'b000) ?        // SB
+                (4'b0001 << byteOffset) :
+            (funct3 == 3'b001) ?        // SH
+                (byteOffset[1] ? 4'b1100 : 4'b0011) :
+                                       // SW (funct3 == 010)
+                4'b1111
+        ) : 4'b0000;
+
+    // Dado de leitura formatado para LB/LBU/LH/LHU/LW
+    wire [7:0]  loadByte = (byteOffset == 2'b00) ? ReadData[7:0]   :
+                           (byteOffset == 2'b01) ? ReadData[15:8]  :
+                           (byteOffset == 2'b10) ? ReadData[23:16] :
+                                                   ReadData[31:24];
+
+    wire [15:0] loadHalf = (byteOffset[1] == 1'b0) ?
+                            ReadData[15:0] :
+                            ReadData[31:16];
+
+    assign LoadData =
+        (funct3 == 3'b000) ? {{24{loadByte[7]}},  loadByte} : // LB
+        (funct3 == 3'b100) ? {24'b0,               loadByte} : // LBU
+        (funct3 == 3'b001) ? {{16{loadHalf[15]}}, loadHalf} : // LH
+        (funct3 == 3'b101) ? {16'b0,              loadHalf} : // LHU
+                             ReadData;                        // LW (funct3 == 010)
+
+    // Quando escreve no banco de registradores?
+    assign writeBackEn =
+        (rdId_A3 != 0) && (
+          // EXECUTE: ALU, JAL, JALR, AUIPC, LUI
+          (state == EXECUTE &&
+           (isALUreg | isALUimm | isJAL | isJALR | isAUIPC | isLUI)) ||
+          // WAIT_DATA: loads
+          (state == WAIT_DATA && isLoad)
+        );
+
+    // O que escreve no banco de registradores?
+    assign writeBackData =
+        isLoad          ? LoadData :
+        isLUI           ? Uimm :
+        isAUIPC         ? PCTarget :
+        (isJAL|isJALR)  ? PCplus4 :
+                          ALUResult;
+
+    // ---------------------------------------------------------
+    // FSM original
+    // ---------------------------------------------------------
     always @(posedge clk)
         if (reset) begin
             PC    <= 0;
